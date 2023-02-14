@@ -1,0 +1,82 @@
+parameters:
+  - name: signingFileName
+    type: string
+    default: 'ConsoleApp3.exe'
+
+trigger: none
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+- group: 'CodeSignGroupNES'
+- name: 'solution'
+  value: '**/*.sln'
+- name: 'buildPlatform'
+  value: 'Any CPU'
+- name: 'buildConfiguration'
+  value: 'Release'
+
+steps:
+- checkout: self
+  lfs: true
+
+- task: NuGetToolInstaller@1
+
+- task: NuGetCommand@2
+  inputs:
+    restoreSolution: '$(solution)'
+
+- task: DownloadSecureFile@1
+  name: UploadToSharePoint
+  displayName: 'PSファイル取得（ファイルアップロード処理）'
+  inputs:
+    secureFile: 'UploadToSharePoint.ps1'
+
+- task: DotNetCoreCLI@2
+  inputs:
+   command: 'custom'
+   custom: 'tool'
+   arguments: 'install --global azuresigntool'
+  displayName: "Azure SignToolのインストール"
+
+- task: VSBuild@1
+  inputs:
+    solution: '$(solution)'
+    msbuildArgs: '/p:DeployOnBuild=true /p:WebPublishMethod=Package /p:PackageAsSingleFile=true /p:SkipInvalidConfigurations=true /p:DesktopBuildPackageLocation="$(build.artifactStagingDirectory)\WebApp.zip" /p:DeployIisAppPath="Default Web Site"'
+    platform: '$(buildPlatform)'
+    configuration: '$(buildConfiguration)'
+
+- pwsh: |
+    $arg = @()
+    $FileName = "${{parameters.signingFileName}}"
+    $SearchFileNames = $FileName -split ","
+    foreach($SearchFileName in $SearchFileNames){
+    $fileSearchResult = Get-ChildItem -Filter $SearchFileName -Name -Recurse -File 
+    $arg+=$fileSearchResult
+    }
+    $signfilesStr = $arg -join ";"
+    Write-Host "##vso[task.setvariable variable=signFiles;]$signfilesStr"
+  displayName: "署名対象の検索"
+
+- task: CmdLine@2
+  displayName: 'コード署名処理'
+  inputs:
+    script: |
+      for %%a in ($(signFiles)) do (
+        AzureSignTool sign -kvt "$(TenantID)" -kvu "$(KeyContainerURI)" -kvi "$(KeyVaultCleintID)" -kvs "$(KeyVaultSecret)" -kvc "DigiCert" -v "$(Pipeline.Workspace)\s\%%a" -tr http://timestamp.globalsign.com/tsa/r6advanced1
+      )
+
+- task: PowerShell@2
+  displayName: 'ファイルアップロード処理'
+  inputs:
+    filePath: $(UploadToSharePoint.secureFilePath)
+    arguments: -FromPath '$(signFiles)' -FileName '${{parameters.signingFileName}}' -ToDocLibId $(ToDocID_UploadFile) -ToListId $(ToListID) -ToPath $(Build.DefinitionName) -TenantDomain $(TenantDomain) -SiteName $(SiteName) -ClientId $(GraphClientID) -TenantId $(tenantID) -ClientSecret $(GraphSecret)
+
+- task: PublishPipelineArtifact@1
+  inputs:
+    targetPath: '$(Pipeline.Workspace)'
+    artifact: 'drop'
+    publishLocation: 'pipeline'
+  condition: failed()
+  displayName: "署名ファイルの発行"
